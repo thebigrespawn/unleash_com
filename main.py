@@ -1,147 +1,163 @@
+from flask import Flask, request, jsonify, send_file
 import ee
-ee.Initialize(project='key-scarab-332210')
+import io
+import numpy as np
+from PIL import Image
+import requests
+from datetime import date, timedelta
+
+# ------------------------
+# 0. Initialize Earth Engine
+# ------------------------
+SERVICE_ACCOUNT = 'unleash-treeger@key-scarab-332210.iam.gserviceaccount.com'
+KEY_FILE = 'key-scarab-332210-fe55f40b5089.json'
+
+credentials = ee.ServiceAccountCredentials(SERVICE_ACCOUNT, KEY_FILE)
+ee.Initialize(credentials)
+
+# ------------------------
+# 1. Flask app
+# ------------------------
+app = Flask(__name__)
 
 # ---------- CONFIG ----------
-POLYGON = [
-      [56.73698287457228, 37.461360390525726],
-      [37.46150356833912, 56.73837695270777],
-      [56.73854425549507, 37.46047763204037],
-      [56.73715017735958, 37.460334452262494],
-    ]
-FIELD = ee.Geometry.Polygon([POLYGON])
-
-START = '2025-06-01'
-END   = '2025-08-31'
-SCALE = 10
-
-# thresholds (tweak to taste)
-CLOUD_PROB_TH = 40   # cloud probability threshold
+SCALE = 10                # full Sentinel-2 resolution
+CLOUD_PROB_TH = 30
 NDVI_MIN = 0.35
-NDWI_MAX = 0.10
-MIN_CONNECTED_PIXELS = 5
-DYING_THRESH = -0.002  # NDVI/day
-HEALTHY_THRESH = 0.002
+NDWI_MAX = 0.05               # stricter water mask
+BSI_MAX = 0.2                 # bare soil index threshold
+MIN_CONNECTED_PIXELS = 10
+CONNECTED_MAXSIZE = 256       # for faster connectedPixelCount
+DEFAULT_MAX_IMAGES = None      # limit to best N images (None = no limit)
 
-# ---------- 1) load collections ----------
-s2 = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
-      .filterBounds(FIELD)
-      .filterDate(START, END)
-      .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 70))
-      .sort('system:time_start', False))
+# ------------------------
+# 2. Helpers
+# ------------------------
+def download_tif(image, region, scale):
+    """Download EE image as temporary TIFF bytes. Uses tileScale to reduce memory pressure."""
+    url = image.getDownloadURL({
+        "scale": scale,
+        "region": region.getInfo(),
+        "format": "GEO_TIFF",
+        "tileScale": 4
+    })
+    r = requests.get(url, timeout=180)
+    r.raise_for_status()
+    return io.BytesIO(r.content)
 
-cloud_prob = (ee.ImageCollection('COPERNICUS/S2_CLOUD_PROBABILITY')
+
+def severity_to_red_alpha_png(severity_bytes, veg_bytes):
+    """Return RGBA PNG bytes for masked severity."""
+    import rasterio
+    with rasterio.MemoryFile(severity_bytes) as mem_sev, rasterio.MemoryFile(veg_bytes) as mem_veg:
+        with mem_sev.open() as src_sev:
+            severity = src_sev.read(1).astype(np.float32)
+        with mem_veg.open() as src_veg:
+            veg = src_veg.read(1).astype(np.uint8)
+
+    severity = np.clip(severity, 0, 1)
+    red = (severity * 255).astype(np.uint8)
+    alpha = np.where(veg > 0, red, 0).astype(np.uint8)
+
+    rgba = np.zeros((severity.shape[0], severity.shape[1], 4), dtype=np.uint8)
+    rgba[:, :, 0] = red
+    rgba[:, :, 3] = alpha
+
+    buf = io.BytesIO()
+    Image.fromarray(rgba, mode='RGBA').save(buf, format='PNG')
+    buf.seek(0)
+    return buf
+
+# ------------------------
+# 3. Main route
+# ------------------------
+@app.route('/compute_masks', methods=['POST'])
+def compute_masks():
+    data = request.json or {}
+    coords = data.get("polygon")
+    if not coords or len(coords) < 3:
+        return jsonify({"error": "Polygon must have at least 3 points"}), 400
+
+    max_images = data.get("max_images", DEFAULT_MAX_IMAGES)
+    FIELD = ee.Geometry.Polygon([coords])
+    END = data.get("end", date.today().isoformat())
+    START = data.get("start", (date.today() - timedelta(days=7)).isoformat())
+
+    # Load Sentinel-2 collections
+    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+          .filterBounds(FIELD)
+          .filterDate(START, END)
+          .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", 70))
+          .sort("system:time_start"))
+
+    if max_images is not None:
+        s2 = s2.sort('CLOUDY_PIXEL_PERCENTAGE').limit(int(max_images))
+
+    cloudp = (ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY")
               .filterBounds(FIELD)
               .filterDate(START, END))
 
-# join cloud probability by system:index
-saveCloud = ee.Join.saveFirst(matchKey='cloud_prob')
-matchFilter = ee.Filter.equals(leftField='system:index', rightField='system:index')
-joined = saveCloud.apply(primary=s2, secondary=cloud_prob, condition=matchFilter)
-s2_joined = ee.ImageCollection(joined)
+    joined = ee.Join.saveFirst("cloud").apply(s2, cloudp, ee.Filter.equals("system:index", None, "system:index"))
+    coll = ee.ImageCollection(joined)
 
-# ---------- 2) function to prepare each image for slope and composite ----------
-def prepare(img_element):
-    img = ee.Image(img_element)  # ensure Image
+    try:
+        coll_count = coll.size().getInfo()
+    except Exception as e:
+        return jsonify({"error": "Failed to query collection size", "detail": str(e)}), 500
+    if coll_count == 0:
+        return jsonify({"error": "No Sentinel-2 images for the polygon/date range. Expand dates."}), 400
 
-    # attached cloud probability image (or fallback)
-    cloud_prop = img.get('cloud_prob')
-    cloud_img = ee.Image(ee.Algorithms.If(
-        cloud_prop,
-        ee.Image(cloud_prop),                   # attached cloud image
-        ee.Image.constant(0).rename('probability')  # fallback: zeros
-    ))
-    cloud_prob_band = ee.Image(cloud_img).select('probability')
+    # Prepare images: NDVI, NDWI, Bare Soil Index (BSI), cloud mask
+    def prepare(img):
+        img = ee.Image(img)
+        cloud_img = ee.Image(img.get("cloud"))
+        cmask = cloud_img.select("probability").lt(CLOUD_PROB_TH)
 
-    # build cloud mask
-    cloud_mask = cloud_prob_band.lt(CLOUD_PROB_TH)
+        ndvi = img.normalizedDifference(["B8", "B4"]).rename("NDVI").float()
+        ndwi = img.normalizedDifference(["B3", "B8"]).rename("NDWI").float()
+        bsi = ((img.select("B11").add(img.select("B4")))
+               .subtract(img.select("B8").add(img.select("B2"))))
+        bsi = bsi.divide(img.select("B11").add(img.select("B4").add(img.select("B8")).add(img.select("B2")))).rename("BSI")
 
-    # compute NDVI (SR bands)
-    ndvi = img.normalizedDifference(['B8', 'B4']).rename('NDVI')
+        veg_mask = ndvi.gte(NDVI_MIN).And(ndwi.lt(NDWI_MAX)).And(bsi.lt(BSI_MAX))
+        time = ee.Image.constant(ee.Date(img.get("system:time_start")).millis()).rename("time").toFloat()
+        return ee.Image().addBands([ndvi, ndwi, bsi, time]).updateMask(cmask.And(veg_mask))
 
-    # add time band as float for regression
-    time_millis = ee.Image.constant(ee.Date(img.get('system:time_start')).millis()).float().rename('time')
+    prep = ee.ImageCollection(coll.map(prepare))
 
-    # return image with NDVI and time, masked by cloud mask
-    return img.addBands([ndvi, time_millis]).updateMask(cloud_mask)
+    med = prep.reduce(ee.Reducer.percentile([50])).clip(FIELD)
+    veg_raw = med.select("NDVI_p50").gte(NDVI_MIN).And(med.select("NDWI_p50").lt(NDWI_MAX))
 
-prepared = s2_joined.map(prepare)
 
-# ensure we have images
-n = prepared.size().getInfo()
-if n == 0:
-    raise RuntimeError('No cloud-free images after cloud masking in specified period.')
+    veg = veg_raw.updateMask(veg_raw).rename("veg").toByte()
 
-# ---------- 3) median composite for vegetation mask ----------
-median = prepared.median().clip(FIELD)
+    connected = veg_raw.connectedPixelCount(CONNECTED_MAXSIZE, True)
+    veg_clean = veg_raw.updateMask(connected.gte(50)).rename("veg_clean")
 
-# NDVI and NDWI on composite
-ndvi_comp = median.select('NDVI')
-ndwi_comp = median.normalizedDifference(['B3', 'B8']).rename('NDWI')
 
-# vegetation raw test
-veg_raw = ndvi_comp.gte(NDVI_MIN).And(ndwi_comp.lt(NDWI_MAX))
+    # NDVI slope -> masked severity
+    fit = prep.select(["time", "NDVI"]).reduce(ee.Reducer.linearFit())
+    slope_day = fit.select("scale").multiply(1000 * 60 * 60 * 24)
+    severity_masked = slope_day.clamp(-0.03, 0).multiply(-1).divide(0.03).updateMask(veg_clean).rename("severity_masked")
 
-# clean the vegetation mask
-veg_img = veg_raw.updateMask(veg_raw).rename('veg').toByte()
-veg_open = veg_img.focal_min(radius=1, units='pixels').focal_max(radius=1, units='pixels')
-connected = veg_open.connectedPixelCount(maxSize=1024, eightConnected=True)
-veg_clean = veg_open.updateMask(connected.gte(MIN_CONNECTED_PIXELS)).rename('veg_clean')
+    try:
+        veg_bytes = download_tif(veg_clean, FIELD, SCALE)
+        severity_bytes = download_tif(severity_masked, FIELD, SCALE)
+    except Exception as e:
+        return jsonify({"error": "Failed to download image from GEE", "detail": str(e)}), 500
 
-# ---------- 4) compute NDVI slope (use the prepared collection with NDVI + time) ----------
-# linear fit reducer across images: expects bands 'time' and 'NDVI'
-regression = prepared.select(['time', 'NDVI']).reduce(ee.Reducer.linearFit())
-# scale to NDVI per day
-slope_per_day = regression.select('scale').multiply(1000 * 60 * 60 * 24).rename('slope_per_day')
+    severity_png = severity_to_red_alpha_png(severity_bytes, veg_bytes)
 
-# ---------- 5) apply vegetation mask to slope (keep slope only where veg_clean==1) ----------
-slope_masked = slope_per_day.updateMask(veg_clean)
+    return send_file(
+        severity_png,
+        mimetype='image/png',
+        as_attachment=True,
+        download_name='severity_red_alpha.png'
+    )
 
-# ---------- 6) visualize slope (dying -> red, stable->yellow, improving->green) ----------
-slope_vis = slope_masked.unitScale(DYING_THRESH, HEALTHY_THRESH).clamp(0,1)
-# convert to RGB visualization: palette from red->yellow->green
-slope_rgb = slope_vis.visualize(palette=['ff0000','ffff00','00ff00'])
 
-# optionally, make non-vegetation transparent by masking slope_rgb with veg_clean
-# Create an RGB image forced to be RGB (3 bands). Then mask.
-slope_rgb_masked = ee.Image(ee.Algorithms.If(
-    slope_rgb, 
-    ee.Image(slope_rgb).updateMask(veg_clean), 
-    ee.Image(slope_rgb).updateMask(veg_clean)
-)).copyProperties(slope_rgb)
-
-# ---------- 7) Export the final visualized health image as GeoTIFF to Drive ----------
-task = ee.batch.Export.image.toDrive(
-    image=ee.Image(slope_rgb_masked),
-    description='veg_health_masked_summer2025_gtiff',
-    folder='EarthEngine',
-    fileNamePrefix='veg_health_masked_summer2025',
-    region=FIELD,
-    scale=SCALE,
-    maxPixels=1e9,
-    fileFormat='GEO_TIFF'
-)
-task.start()
-print('Export task started: veg_health_masked_summer2025 (check Earth Engine Tasks and Drive/EarthEngine).')
-
-# polygon_coords = [
-#     [56.73639949411154, 37.46023172459497],
-#     [56.738184839487076, 37.46023172459497],
-#     [56.738184839487076, 37.45891727703601],
-#     [56.73639949411154, 37.45891727703601],
-# ]
-
-# # Step 1: Find center
-# center_lon = sum([p[0] for p in polygon_coords]) / len(polygon_coords)
-# center_lat = sum([p[1] for p in polygon_coords]) / len(polygon_coords)
-
-# # Step 2: Scale factor
-# scale = 4
-
-# # Step 3: Create new scaled polygon
-# scaled_polygon = []
-# for lon, lat in polygon_coords:
-#     new_lon = center_lon + (lon - center_lon) * scale
-#     new_lat = center_lat + (lat - center_lat) * scale
-#     scaled_polygon.append([new_lon, new_lat])
-
-# print(scaled_polygon)
+# ------------------------
+# 4. Run server
+# ------------------------
+if __name__ == '__main__':
+    app.run(debug=True, port=5050)
