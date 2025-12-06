@@ -46,8 +46,13 @@ def download_tif(image, region, scale):
     return io.BytesIO(r.content)
 
 
-def severity_to_red_alpha_png(severity_bytes, veg_bytes):
-    """Return RGBA PNG bytes for masked severity."""
+def severity_to_red_alpha_png(severity_bytes, veg_bytes, exponent=1.5):
+    """
+    RGBA PNG with:
+    - red at maximum
+    - alpha proportional to normalized severity^exponent
+    - stable regions remain transparent
+    """
     import rasterio
     with rasterio.MemoryFile(severity_bytes) as mem_sev, rasterio.MemoryFile(veg_bytes) as mem_veg:
         with mem_sev.open() as src_sev:
@@ -55,9 +60,26 @@ def severity_to_red_alpha_png(severity_bytes, veg_bytes):
         with mem_veg.open() as src_veg:
             veg = src_veg.read(1).astype(np.uint8)
 
-    severity = np.clip(severity, 0, 1)
-    red = (severity * 255).astype(np.uint8)
-    alpha = np.where(veg > 0, red, 0).astype(np.uint8)
+    # only consider masked vegetation pixels for normalization
+    masked_severity = severity[veg > 0]
+    if masked_severity.size > 0:
+        s_min, s_max = masked_severity.min(), masked_severity.max()
+        # avoid division by zero
+        if s_max > s_min:
+            severity_norm = (severity - s_min) / (s_max - s_min)
+        else:
+            severity_norm = severity * 0  # all same, set to 0
+    else:
+        severity_norm = severity * 0
+
+    # red always max
+    red = np.full(severity.shape, 255, dtype=np.uint8)
+
+    # alpha = normalized^exponent
+    alpha = (severity_norm ** exponent * 255).astype(np.uint8)
+
+    # apply vegetation mask
+    alpha = np.where(veg > 0, alpha, 0)
 
     rgba = np.zeros((severity.shape[0], severity.shape[1], 4), dtype=np.uint8)
     rgba[:, :, 0] = red
@@ -67,6 +89,7 @@ def severity_to_red_alpha_png(severity_bytes, veg_bytes):
     Image.fromarray(rgba, mode='RGBA').save(buf, format='PNG')
     buf.seek(0)
     return buf
+
 
 # ------------------------
 # 3. Main route
